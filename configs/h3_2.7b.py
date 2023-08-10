@@ -3,21 +3,19 @@ JOB_NAME = "h3_train"
 SEQ_LEN = 2048
 HIDDEN_SIZE = 2560
 NUM_ATTENTION_HEAD = 32
-MLP_RATIO = 4.0
+MLP_RATIO = 8 / 3
 NUM_LAYER = 32
-VOCAB_SIZE = 64000
-
-model_type = 'H3'
-
+VOCAB_SIZE = 103168
+model_type = "H3"
 # Ckpt folder format:
 # fs: 'local:/mnt/nfs/XXX'
 # oss: 'boto3:s3://model_weights/XXX'
-MODEL_ONLY_FOLDER = None
-SAVE_CKPT_FOLDER = None
-LOAD_CKPT_FOLDER = None
+# MODEL_ONLY_FOLDER = "local:llm_ckpts/xxxx"
+# SAVE_CKPT_FOLDER = "local:llm_ckpts"
+# LOAD_CKPT_FOLDER = "local:llm_ckpts/49"
 ckpt = dict(
     # Path to save training ckpt.
-    save_ckpt_folder=SAVE_CKPT_FOLDER,
+    save_ckpt_folder=None,
     # Path to continue training ckpt (load model weights and scheduler/context states).
     # load_ckpt_folder=LOAD_CKPT_FOLDER,
     # Path to initialize with given model weights.
@@ -27,8 +25,8 @@ ckpt = dict(
     load_optimizer=True,
 )
 
-TRAIN_FOLDER = None
-VALID_FOLDER = None
+TRAIN_FOLDER = "/path/to/dataset"
+VALID_FOLDER = "/path/to/dataset"
 data = dict(
     seq_len=SEQ_LEN,
     # micro_num means the number of micro_batch contained in one gradient update
@@ -40,7 +38,7 @@ data = dict(
     # defaults to 0, means disable evaluate
     valid_every=50,
     pack_sample_into_one=False,
-    total_steps=20,
+    total_steps=5000,
     skip_batches="",
     rampup_batch_size="",
     # Datasets with less than 50 rows will be discarded
@@ -110,13 +108,13 @@ model = dict(
     embed_split_hidden=True,
     vocab_size=VOCAB_SIZE,
     embed_grad_scale=1,
-    parallel_output=False,
+    parallel_output=True,
     hidden_size=HIDDEN_SIZE,
     num_layers=NUM_LAYER,
     mlp_ratio=MLP_RATIO,
     apply_post_layer_norm=False,
     dtype="torch.bfloat16",
-    norm_type="layernorm",
+    norm_type="rmsnorm",
     layer_norm_epsilon=1e-5,
     use_flash_attn=True,
     num_chunks=1,  # if num_chunks > 1, interleaved pipeline scheduler is used.
@@ -143,8 +141,8 @@ tensor parallel: tensor parallel size, usually the number of GPUs per node.
 """
 parallel = dict(
     zero1=0,
-    tensor=1,
-    pipeline=dict(size=8, interleaved_overlap=False),
+    tensor=2,
+    pipeline=dict(size=4, interleaved_overlap=True),
 )
 
 cudnn_deterministic = False

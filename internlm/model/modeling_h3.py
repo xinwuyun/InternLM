@@ -1,52 +1,41 @@
-import os
-import sys 
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+
 import math
-import re
-from functools import partial
 from typing import Optional
 
-# from collections import namedtuple, OrderedDict
-# from collections.abc import Sequence
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# from flash_attn.modules.mha import MHA
-from flash_attn.modules.mlp import Mlp, FusedMLP, ParallelFusedMLP
 from flash_attn.modules.embedding import ParallelGPT2Embeddings
-try:
-    from flash_attn.ops.rms_norm import RMSNorm, dropout_add_rms_norm
-except ImportError:
-    RMSNorm, dropout_add_rms_norm = None, None
-try:
-    from flash_attn.ops.layer_norm import dropout_add_layer_norm
-except ImportError:
-    dropout_add_layer_norm = None
+from flash_attn.modules.mlp import ParallelFusedMLP
+from torch import nn
 
 from internlm.core.context import IS_TENSOR_PARALLEL, ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
+from internlm.initialize.initialize_tensor import normal_, scaled_init_method_normal
 from internlm.model.embedding import Embedding1D
 from internlm.model.linear import (
     FeedForward,
+    RewardModelLinear,
     ScaleColumnParallelLinear,
 )
-from internlm.initialize.initialize_tensor import normal_, scaled_init_method_normal
-from internlm.model.ssm.h3 import H3
 from internlm.model.multi_head_attention import MHA
-from internlm.model.utils import gather_forward_split_backward
+from internlm.model.utils import gather_forward_split_backward, try_import_RMSNorm
 from internlm.solver.pipeline_utils import partition_uniform
 from internlm.utils.checkpoint import activation_checkpoint
 from internlm.utils.common import filter_kwargs
 from internlm.utils.logger import get_logger
 from internlm.utils.registry import MODEL_INITIALIZER
+from internlm.model.ssm.h3 import H3
 
 MODEL_TYPE = "H3"
-logger = get_logger(__file__)
 
-class SSMModelBlock(nn.Module):
+logger = get_logger(__file__)
+RMSNorm = try_import_RMSNorm()
+
+
+class PackedFlashBaseSSMLayer1D(nn.Module):
     """
-    1D SSMModel Flash Base Layer.
+    1D Packed Flash Base Layer.
 
     Args:
         hidden_size (int): The hidden size of model. 768 by default.
@@ -66,38 +55,104 @@ class SSMModelBlock(nn.Module):
 
     def __init__(
         self,
-        hidden_size,
-        mixer_cls: None,
-        mlp_cls: None,
-        norm_cls=nn.LayerNorm,
+        hidden_size: int = 768,
+        num_attention_heads: int = 12,
+        mlp_ratio: int = 4,
+        attn_drop_rate: float = 0,
         drop_rate: float = 0.0,
+        dtype: torch.dtype = torch.float,
         layer_norm_epsilon: float = 1e-6,
+        checkpoint: bool = False,
         layer_idx: int = 0,
         residual_in_fp32: bool = False,
+        device: Optional[torch.device] = None,
+        norm_type: str = "rmsnorm",
         dropout_selective_checkpoint: bool = True,
-        checkpoint: bool = False,
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
         use_flash_attn: bool = True,
+        attn_layer_idx = None,
+        ssm_cfg = None,
     ):
         super().__init__()
+        self.checkpoint = checkpoint
         # dropout selective checkpoint can only be enabled when checkpoint is disabled.
         self.dropout_selective_checkpoint = dropout_selective_checkpoint is True and checkpoint is False
         self.layer_idx = layer_idx
         self.use_flash_attn = use_flash_attn
+
+        head_dim = hidden_size // num_attention_heads
         
-        self.mixer = mixer_cls(hidden_size)
+        # if layer_idx in attn_layer_idx: 
+        #     self.mixer = MHA(
+        #         embed_dim=hidden_size,
+        #         num_heads=num_attention_heads,
+        #         process_group=gpc.get_group(ParallelMode.TENSOR),
+        #         dropout=attn_drop_rate,
+        #         softmax_scale=1 / math.sqrt(head_dim),
+        #         causal=True,
+        #         layer_idx=layer_idx,
+        #         rotary_emb_dim=head_dim,
+        #         rotary_emb_scale_base=0,
+        #         use_flash_attn=use_flash_attn,
+        #         device=device,
+        #         dtype=dtype,
+        #     )
+        # else:
+        #     self.mixer = H3(
+        #         d_model=hidden_size,
+        #         layer_idx=layer_idx,
+        #         **(ssm_cfg if ssm_cfg is not None else {})
+        #     )
+        self.mixer = MHA(
+                embed_dim=hidden_size,
+                num_heads=num_attention_heads,
+                process_group=gpc.get_group(ParallelMode.TENSOR),
+                dropout=attn_drop_rate,
+                softmax_scale=1 / math.sqrt(head_dim),
+                causal=True,
+                layer_idx=layer_idx,
+                rotary_emb_dim=head_dim,
+                rotary_emb_scale_base=0,
+                use_flash_attn=use_flash_attn,
+                device=device,
+                dtype=dtype)
 
         self.dropout1 = nn.Dropout(drop_rate)
-    
-        self.norm1 = norm_cls(hidden_size)
-        self.norm2 = norm_cls(hidden_size)
+        if norm_type == "rmsnorm":
+            self.norm1 = RMSNorm(hidden_size, eps=layer_norm_epsilon)
+            self.norm2 = RMSNorm(hidden_size, eps=layer_norm_epsilon)
+        else:
+            self.norm1 = nn.LayerNorm(hidden_size, eps=layer_norm_epsilon)
+            self.norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_epsilon)
 
-        self.mlp = mlp_cls(hidden_size)
-        
+        if use_swiglu:
+            self.mlp = FeedForward(
+                hidden_size,
+                int(hidden_size * mlp_ratio),
+                out_features=hidden_size,
+                process_group=gpc.get_group(ParallelMode.TENSOR),
+                bias=False,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            self.mlp = ParallelFusedMLP(
+                hidden_size,
+                int(hidden_size * mlp_ratio),
+                out_features=hidden_size,
+                activation="gelu_approx",
+                process_group=gpc.get_group(ParallelMode.TENSOR),
+                bias1=False,
+                bias2=False,
+                sequence_parallel=gpc.config.model.sequence_parallel,
+                checkpoint_lvl=0,
+                heuristic="auto",
+                device=device,
+                dtype=dtype,
+            )
         self.dropout2 = nn.Dropout(drop_rate)
         self.use_swiglu = use_swiglu
-        self.checkpoint = checkpoint
         self.use_scaled_init = use_scaled_init
         self.residual_in_fp32 = residual_in_fp32  # only make sense when using prenorm
         self.return_residual = False
@@ -156,8 +211,7 @@ class SSMModelBlock(nn.Module):
         def _dropout_and_norm_attn(_hidden_states):
             _dropped = self.dropout1(_hidden_states)
             _residual = _dropped
-            # logger.error(f"this is: {os.getcwd()},{os.path.basename(__file__)},{sys._getframe().f_lineno}, PP_rank:{gpc.get_local_rank(ParallelMode.PIPELINE)} _residual.dtype:{_residual.dtype} _residual.float().dtype:{_residual.float().dtype} self.norm1.weight.dtype: {self.norm1.weight.dtype}")
-            _hidden_states = self.norm1(_residual)
+            _hidden_states = self.norm1(_residual.float())
             return _residual, _hidden_states
 
         if self.dropout_selective_checkpoint:
@@ -167,7 +221,7 @@ class SSMModelBlock(nn.Module):
 
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
-
+        
         if isinstance(self.mixer, MHA):
             if len(hidden_states.shape) == 3:
                 hidden_states = hidden_states.squeeze(0)
@@ -180,7 +234,7 @@ class SSMModelBlock(nn.Module):
         def _dropout_and_norm_ffn(_residual, _hidden_states):
             _dropped = self.dropout2(_hidden_states)
             _residual = (_dropped + _residual) if _residual is not None else _dropped
-            _hidden_states = self.norm2(_residual)
+            _hidden_states = self.norm2(_residual.float())
             return _residual, _hidden_states
 
         if self.dropout_selective_checkpoint:
@@ -196,131 +250,85 @@ class SSMModelBlock(nn.Module):
         return hidden_states + residual
 
 
-def create_mixer_cls(ssm_cls=H3, ssm_cfg=None, attn_layer_idx=None, attn_cfg=None, layer_idx=None):
-    if attn_layer_idx is not None and layer_idx in attn_layer_idx:
-        if attn_cfg:
-            attn_cfg['layer_idx'] = layer_idx
-        causal = True if attn_cfg is None else attn_cfg.pop('causal', True)
-        layer_idx = True if attn_cfg is None else attn_cfg.pop('layer_idx', True)
-        mixer_cls = partial(MHA, layer_idx=layer_idx, causal=causal, 
-                            **(attn_cfg if attn_cfg is not None else {}))
-    else:
-        mixer_cls = partial(ssm_cls, layer_idx=layer_idx,
-                            **(ssm_cfg if ssm_cfg is not None else {}))
-    return mixer_cls
+class PackedFlashSSM1D(nn.Module):
+    """
+    1D Packed Flash InternLm.
 
-def create_block(hidden_size, 
-                 ssm_cls=H3, 
-                 norm_cls=nn.LayerNorm,
-                 ssm_cfg=None, 
-                 mlp_cfg=None,
-                 attn_layer_idx=None,
-                 attn_cfg=None,
-                 drop_rate=0.0, 
-                 residual_in_fp32=False,
-                 layer_idx=None,
-                 **kwargs):
-    mixer_cls = create_mixer_cls(ssm_cls=ssm_cls, 
-                                 ssm_cfg=ssm_cfg, 
-                                 attn_layer_idx=attn_layer_idx,
-                                 attn_cfg=attn_cfg, 
-                                 layer_idx=layer_idx)
-    # mlp_cls = create_mlp_cls(hidden_size, d_inner=d_inner, fused_mlp=fused_mlp, mlp_cls=mlp_cls)
-    mlp_cls = partial(ParallelFusedMLP, **(mlp_cfg if mlp_cfg is not None else {}))
-    
-    block = SSMModelBlock(hidden_size, 
-                          mixer_cls, 
-                          mlp_cls, 
-                          norm_cls=norm_cls, 
-                          drop_rate=drop_rate,
-                          residual_in_fp32=residual_in_fp32,
-                          **kwargs
-                          )
-    block.layer_idx = layer_idx
-    return block
+    Args:
+        num_layers (int): The number of layer. 12 by default.
+        hidden_size (int): The size of hidden state. 768 by default.
+        num_attention_heads (int): The number of attention head. 12 by default.
+        vocab_size (int): The size of vocabulary. 50304 by default.
+        mlp_ratio (int): The ratio of MLP layers. 4 by default.
+        attn_drop_rate (float): The dropout rate of attention module. 0.0 by default.
+        drop_rate (float): The dropout rate of input hidden state. 0.0 by default.
+        dtype (torch.dtype): The type of data. torch.float by default.
+        checkpoint (bool): Whether to use checkpointing to save VRAM. True by default.
+        checkpoint_fraction (float): The proportion of layers that need to be checkpointed compared to the total number
+                                    of layers. 1.0 by default.
+        layer_norm_epsilon (float): A value added to the denominator for numerical stability. 1e-6 by default.
+        first (bool): Whether input embedding layer or not. False by default.
+        last (bool): Whether output embedding layer or not. False by default.
+        embed_split_hidden (bool): Split the embedding layer in the hidden state dimention or vocabulary dimention.
+                                    True by default.
+        embed_grad_scale (float): Refer to GLM-130B, for training stability. 0.1 by default.
+        parallel_output (bool): If it is necessary to collect the output of parallel computing. True by default.
+        start_layer_idx (int): The index of start layer in the pipeline. 0 by default.
+        device (Optional[Union[str, torch.device]]): The device will be used. None by default.
+        residual_in_fp32 (bool): Whether to use residual in fp32. False by default.
+        norm_type (str): Normalization type. Use RMSNorm or LayerNorm. "rmsnorm" by default.
+        use_flash_attn (bool): Whether to use flash-attn. True by default.
 
-
-# https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
-def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_residual=True,
-                  glu_act=False):
-    if isinstance(module, nn.Linear):
-        nn.init.normal_(module.weight, std=initializer_range)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.Embedding):
-        nn.init.normal_(module.weight, std=initializer_range)
-
-    if rescale_prenorm_residual:
-        # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
-        #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
-        #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
-        #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
-        #
-        # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
-        for name, p in module.named_parameters():
-            if name in ["out_proj.weight", "fc2.weight"]:
-                # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
-                nn.init.normal_(p, mean=0.0, std=initializer_range / math.sqrt(2 * n_layer))
-            # If using GLU activation for now, we scale the std by 2
-            elif name in ["output_linear.0.weight"]:
-                # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
-                if not glu_act:
-                    nn.init.normal_(p, mean=0.0, std=initializer_range / math.sqrt(2 * n_layer))
-                else:
-                    out_features = p.shape[0]
-                    # Multiplying the first half of the matrix by 2 since sigmoid scales it down by 0.5
-                    # on average.
-                    nn.init.normal_(p[:out_features // 2], mean=0.0, std=initializer_range / math.sqrt(2 * n_layer) * 2)
-
-
-class SSMModel(nn.Module):
+    """
 
     def __init__(
-        self, 
-        hidden_size: int, 
-        num_layers: int, 
-        vocab_size: int, 
-        ssm_cfg=None,
-        attn_layer_idx=None, 
-        attn_drop_rate: float = 0,
-        drop_rate: float = 0.0, 
-        max_position_embeddings=0,
-        checkpoint: bool = False,
-        mlp_ratio: int=4,
-        # embed_dropout: float = 0.1, 
-        # dropout_cls=nn.Dropout,
-        norm_type=None,
-        embed_grad_scale: float = 1.0, # Default to 1.0
-        layer_norm_epsilon: float = 1e-5, 
-        num_attention_heads: int=32,
-        initializer_cfg=None,
-        residual_in_fp32=False,
-        first: bool = True,
-        last: bool = True,
-        start_layer_idx: int = 0,
-        parallel_output: bool = True,
-        embed_split_hidden: bool = False,
-        device: Optional[torch.device] = None,
+        self,
+        num_layers: int = 12,
+        hidden_size: int = 768,
+        num_attention_heads: int = 12,
+        vocab_size: int = 50304,
+        mlp_ratio: int = 4.0,
+        attn_drop_rate: float = 0.0,
+        drop_rate: float = 0.0,
         dtype: torch.dtype = torch.float,
-        # pass to SSMModelBlock
+        checkpoint: bool = False,
+        checkpoint_fraction: float = 1.0,
+        layer_norm_epsilon: float = 1e-5,
+        first: bool = False,
+        last: bool = False,
+        embed_split_hidden: bool = False,
+        embed_grad_scale: float = 0.1,
+        parallel_output: bool = True,
+        start_layer_idx: int = 0,
+        device: Optional[torch.device] = None,
+        residual_in_fp32: bool = False,
+        norm_type: str = "rmsnorm",
+        is_reward: bool = False,
         dropout_selective_checkpoint: bool = True,
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
         use_flash_attn: bool = True,
-    ) -> None:
+        # SSM
+        attn_layer_idx=None,
+        ssm_cfg=None
+    ):
         super().__init__()
-        self.first = first
-        self.last = last
-        self.checkpoint = checkpoint
-        norm_cls = partial(RMSNorm, eps=layer_norm_epsilon) if norm_type == 'rmsnorm' else partial(nn.LayerNorm, eps=layer_norm_epsilon)
-        
-        if self.checkpoint:
-            raise NotImplementedError("Checkpointing not supported for h3 currently.")
+
+        self.use_flash_attn = use_flash_attn
+        if checkpoint_fraction <= 0:
+            checkpoint = False
+        if not checkpoint:
+            checkpoint_fraction = 0
+        checkpoint_layer_num = num_layers * checkpoint_fraction
+        if is_reward:
+            head_cls = RewardModelLinear
+        else:
+            head_cls = ScaleColumnParallelLinear
         if first:
             if embed_split_hidden:
-                self.embeddings = Embedding1D(num_embeddings=vocab_size, embedding_dim=hidden_size)
+                self.embedding = Embedding1D(num_embeddings=vocab_size, embedding_dim=hidden_size)
             else:
-                self.embeddings = ParallelGPT2Embeddings(
+                self.embedding = ParallelGPT2Embeddings(
                     embed_dim=hidden_size,
                     vocab_size=vocab_size,
                     max_position_embeddings=-1,
@@ -330,67 +338,44 @@ class SSMModel(nn.Module):
                     device=device,
                     dtype=dtype,
                 )
-            for _, param in self.embeddings.named_parameters():
+            for _, param in self.embedding.named_parameters():
                 normal_(std=0.0052)(param)
                 if gpc.get_world_size(ParallelMode.TENSOR) > 1:
                     setattr(param, IS_TENSOR_PARALLEL, True)
         self.embed_grad_scale = embed_grad_scale
-        self.residual_in_fp32 = residual_in_fp32
-        
-        self.parallel_output = parallel_output
-        
-        head_dim = hidden_size // num_attention_heads
-        attn_cfg = dict(
-            num_heads=num_attention_heads,
-            process_group=gpc.get_group(ParallelMode.TENSOR),
-            dropout=attn_drop_rate,
-            softmax_scale=1 / math.sqrt(head_dim),
-            causal=True,
-            rotary_emb_dim=head_dim,
-            rotary_emb_scale_base=0,
-            device=device,
-            dtype=dtype,
+        self.blocks = nn.ModuleList(
+            [
+                PackedFlashBaseSSMLayer1D(
+                    hidden_size=hidden_size,
+                    num_attention_heads=num_attention_heads,
+                    mlp_ratio=mlp_ratio,
+                    attn_drop_rate=attn_drop_rate,
+                    drop_rate=drop_rate,
+                    dtype=dtype,
+                    layer_norm_epsilon=layer_norm_epsilon,
+                    checkpoint=lid < checkpoint_layer_num,
+                    layer_idx=lid + start_layer_idx,  # This parameter is used for caching during generation
+                    residual_in_fp32=residual_in_fp32,
+                    device=device,
+                    norm_type=norm_type,
+                    dropout_selective_checkpoint=dropout_selective_checkpoint,
+                    use_scaled_init=use_scaled_init,
+                    use_swiglu=use_swiglu,
+                    use_flash_attn=use_flash_attn,
+                    attn_layer_idx=attn_layer_idx,
+                    ssm_cfg=ssm_cfg,
+                )
+                for lid in range(num_layers)
+            ]
         )
-        mlp_cfg = dict(
-            hidden_features=int(hidden_size * mlp_ratio),
-            out_features=hidden_size,
-            activation="gelu_approx",
-            process_group=gpc.get_group(ParallelMode.TENSOR),
-            bias1=False,
-            bias2=False,
-            sequence_parallel=gpc.config.model.sequence_parallel,
-            checkpoint_lvl=0,
-            heuristic="auto",
-            device=device,
-            dtype=dtype,
-        )#TODO
-        self.layers = nn.ModuleList([create_block(
-            hidden_size, 
-            # d_inner=mlp_ratio * hidden_size, 
-            ssm_cfg=ssm_cfg, 
-            attn_layer_idx=attn_layer_idx,
-            attn_cfg=attn_cfg, 
-            layer_norm_epsilon=layer_norm_epsilon,
-            residual_in_fp32=residual_in_fp32,
-            layer_idx=i + start_layer_idx,
-            mlp_cfg=mlp_cfg,
-            norm_cls=norm_cls,
-            drop_rate=drop_rate,
-            # pass to SSMModelBlock
-            checkpoint=checkpoint,
-            dropout_selective_checkpoint=dropout_selective_checkpoint,
-            use_scaled_init=use_scaled_init,
-            use_swiglu=use_swiglu,
-            use_flash_attn=use_flash_attn,
-        ) for i in range(num_layers)])
-        self.apply(partial(_init_weights, n_layer=num_layers,
-                           **(initializer_cfg if initializer_cfg is not None else {})))
-        
         if last:
-            self.norm = norm_cls(hidden_size)
-            self.head = ScaleColumnParallelLinear(
+            if norm_type == "rmsnorm":
+                self.norm = RMSNorm(hidden_size, eps=layer_norm_epsilon)
+            else:
+                self.norm = nn.LayerNorm(hidden_size, eps=layer_norm_epsilon)
+            self.head = head_cls(
                 in_features=hidden_size,
-                out_features=vocab_size,
+                out_features=gpc.get_world_size(ParallelMode.TENSOR) if is_reward else vocab_size,
                 process_group=gpc.get_group(ParallelMode.TENSOR),
                 bias=False,
                 device=device,
@@ -401,10 +386,12 @@ class SSMModel(nn.Module):
                 normal_(std=0.0052)(param)
                 if gpc.get_world_size(ParallelMode.TENSOR) > 1:
                     setattr(param, IS_TENSOR_PARALLEL, True)
-        
-    def forward(self, hidden_states=None, input_ids=None, inference_params=None, cu_seqlens=None, indexes=None, max_seqlen=None):
-        if self.first:
-            hidden_states = self.embeddings(input_ids)
+        self.parallel_output = parallel_output
+
+    def forward(self, hidden_states=None, cu_seqlens=None, input_ids=None, indexes=None, inference_params=None):
+        # attention_mask: compute attention on the places where the value is 1
+        if hasattr(self, "embedding"):
+            hidden_states = self.embedding(input_ids)
             if self.embed_grad_scale != 1:
                 hidden_states = (
                     self.embed_grad_scale * hidden_states + (1 - self.embed_grad_scale) * hidden_states.detach()
@@ -423,96 +410,25 @@ class SSMModel(nn.Module):
             # The indexes are used to indicate the actual position IDs of each token in the packed input.
             indexes = indexes[0]
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item() if cu_seqlens is not None else None
-        
-        for layer in self.layers:
-            # logger.error(f"this is: {os.getcwd()} {os.path.basename(__file__)} {sys._getframe().f_lineno}, {gpc.get_local_rank(ParallelMode.PIPELINE)} layeridx{layer.layer_idx} {hidden_states.shape}")
-            hidden_states = layer(hidden_states, 
-                                    cu_seqlens=cu_seqlens,
-                                    indexes=indexes,
-                                    inference_params=inference_params,
-                                    max_seqlen=max_seqlen,)
-        
+
+        for _, block in enumerate(self.blocks):
+            hidden_states = block(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                indexes=indexes,
+                inference_params=inference_params,
+                max_seqlen=max_seqlen,
+            )
+
         if hasattr(self, "norm"):
-            hidden_states = self.norm(hidden_states)
+            hidden_states = self.norm(hidden_states.float())
         if hasattr(self, "head"):
-            hidden_states = self.head(hidden_states)            
+            hidden_states = self.head(hidden_states)
+
         if not self.parallel_output:
             hidden_states = gather_forward_split_backward(hidden_states, ParallelMode.TENSOR, dim=-1)
-        # cannot return two values
         return hidden_states
 
-
-# class SSMLMHeadModel(nn.Module, GenerationMixin):
-
-#     def __init__(self, hidden_size: int, n_layer: int, d_inner: int, vocab_size: int, ssm_cfg=None,
-#                  attn_layer_idx=None, attn_cfg=None, max_position_embeddings=2048,
-#                  resid_dropout: float = 0.0, embed_dropout: float = 0.1, dropout_cls=nn.Dropout,
-#                  layer_norm_epsilon: float = 1e-5, initializer_cfg=None,
-#                  fused_mlp=False, fused_dropout_add_ln=False, residual_in_fp32=False,
-#                  pad_vocab_size_multiple: int = 1, **kwargs) -> None:
-#         super().__init__()
-#         if vocab_size % pad_vocab_size_multiple != 0:
-#             vocab_size += pad_vocab_size_multiple - (vocab_size % pad_vocab_size_multiple)
-#         self.backbone = SSMModel(
-#             hidden_size=hidden_size, n_layer=n_layer, d_inner=d_inner, vocab_size=vocab_size,
-#             ssm_cfg=ssm_cfg, attn_layer_idx=attn_layer_idx, attn_cfg=attn_cfg,
-#             max_position_embeddings=max_position_embeddings,
-#             resid_dropout=resid_dropout, embed_dropout=embed_dropout,
-#             dropout_cls=dropout_cls, layer_norm_epsilon=layer_norm_epsilon,
-#             initializer_cfg=initializer_cfg, fused_mlp=fused_mlp,
-#             fused_dropout_add_ln=fused_dropout_add_ln, residual_in_fp32=residual_in_fp32, **kwargs
-#         )
-#         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-#         # Initialize weights and apply final processing
-#         self.apply(partial(_init_weights, n_layer=n_layer,
-#                            **(initializer_cfg if initializer_cfg is not None else {})))
-#         self.tie_weights()
-
-#     def tie_weights(self):
-#         self.lm_head.weight = self.backbone.embeddings.word_embeddings.weight
-
-#     def forward(self, input_ids, position_ids=None, inference_params=None, last_token_only=False, attention_mask=None, labels=None):
-#         hidden_states = self.backbone(input_ids, position_ids=position_ids,
-#                                       inference_params=inference_params)
-#         if last_token_only:
-#             lm_logits = self.lm_head(hidden_states)[:, -1, :]
-#         else:
-#             lm_logits = self.lm_head(hidden_states)
-#         CausalLMOutput = namedtuple('CausalLMOutput', ['logits'])
-#         return CausalLMOutput(logits=lm_logits)
-
-#     def load_state_dict(self, state_dict, strict=True):
-#         # Remapping from our checkpoints that used different names
-#         def key_mapping_backbone(key):
-#             key = re.sub(r'^s4seq.encoder.', 'backbone.', key)
-#             key = re.sub(r'^embedding.', 'backbone.embeddings.word_embeddings.', key)
-#             key = re.sub(r'^backbone.norm', 'backbone.ln_0', key)
-#             return key
-#         state_dict = OrderedDict((key_mapping_backbone(k), v) for k, v in state_dict.items())
-#         # Remapping from our checkpoints that used a different ordering of layers in the block
-#         # Previous: Mixer / MLP -> Dropout -> Add -> LN
-#         # Current: Dropout -> Add -> LN -> Attn / MLP
-#         if 'backbone.ln_0.weight' in state_dict:
-#             n_layers = len(self.backbone.layers)
-#             ln_weight = state_dict.pop(f'backbone.layers.{n_layers - 1}.norm2.weight')
-#             ln_bias = state_dict.pop(f'backbone.layers.{n_layers - 1}.norm2.bias')
-#             state_dict['backbone.ln_f.weight'] = ln_weight
-#             state_dict['backbone.ln_f.bias'] = ln_bias
-#             for l in reversed(range(n_layers)):
-#                 ln_weight = state_dict.pop(f'backbone.layers.{l}.norm1.weight')
-#                 ln_bias = state_dict.pop(f'backbone.layers.{l}.norm1.bias')
-#                 state_dict[f'backbone.layers.{l}.norm2.weight'] = ln_weight
-#                 state_dict[f'backbone.layers.{l}.norm2.bias'] = ln_bias
-#                 if l > 0:
-#                     ln_weight = state_dict.pop(f'backbone.layers.{l - 1}.norm2.weight')
-#                     ln_bias = state_dict.pop(f'backbone.layers.{l - 1}.norm2.bias')
-#                     state_dict[f'backbone.layers.{l}.norm1.weight'] = ln_weight
-#                     state_dict[f'backbone.layers.{l}.norm1.bias'] = ln_bias
-#             ln_weight = state_dict.pop('backbone.ln_0.weight')
-#             ln_bias = state_dict.pop('backbone.ln_0.bias')
-#             state_dict[f'backbone.layers.0.norm1.weight'] = ln_weight
-#             state_dict[f'backbone.layers.0.norm1.bias'] = ln_bias
-#         return super().load_state_dict(state_dict, strict=strict)
 
 def _build_generic_model_1d(num_layers, num_chunks, device=torch.device("cuda"), **kwargs):
     """
@@ -546,7 +462,7 @@ def _build_generic_model_1d(num_layers, num_chunks, device=torch.device("cuda"),
         kwargs["last"] = end == num_layers and len(all_parts[-1]) != 0
         kwargs["device"] = device
         kwargs["start_layer_idx"] = start
-        chunk = SSMModel(**filter_kwargs(SSMModel.__init__, kwargs)).to(device)
+        chunk = PackedFlashSSM1D(**filter_kwargs(PackedFlashSSM1D.__init__, kwargs)).to(device)
 
         models.append(chunk)
     torch.distributed.barrier()
@@ -575,8 +491,6 @@ def build_h3_with_cfg(
     norm_type="rmsnorm",
     drop_rate=0,
     attn_drop_rate=0,
-    attn_layer_idx=None,
-    ssm_cfg=None,
     apply_post_layer_norm=False,  # pylint: disable=W0613
     layer_norm_epsilon=1e-5,
     is_reward=False,
@@ -585,6 +499,8 @@ def build_h3_with_cfg(
     use_swiglu: bool = True,
     use_flash_attn: bool = True,
     sequence_parallel: bool = False,  # pylint: disable=W0613
+    attn_layer_idx = None,
+    ssm_cfg = None,
 ):
     """
     Builde model with config
@@ -615,7 +531,7 @@ def build_h3_with_cfg(
         use_scaled_init (bool): Whether to use scaled init. True by default.
         use_swiglu (bool): Whether to use swiglu. True by default.
         use_flash_attn (bool): Whether to use flash-attn. True by default.
-        attn_layer_idx (List[int]): Layer indexes of attention layers
+
     """
 
     cfg = dict(
