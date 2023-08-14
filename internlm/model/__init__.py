@@ -6,6 +6,7 @@ from .linear import FeedForward, RewardModelLinear, ScaleColumnParallelLinear
 from .metrics import AccPerplex
 from .modeling_internlm import build_model_with_cfg
 from .modeling_h3 import build_h3_with_cfg
+from .modeling_retnet import build_retnet_with_cfg
 from .multi_head_attention import MHA
 from .utils import gather_forward_split_backward
 
@@ -19,5 +20,6 @@ __all__ = [
     "MHA",
     "gather_forward_split_backward",
     "build_model_with_cfg",
-    "build_h3_with_cfg"
+    "build_h3_with_cfg",
+    "build_retnet_with_cfg"
 ]
